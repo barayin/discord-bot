@@ -11,7 +11,7 @@ from discord.ext import tasks
 
 import openai
 
-client = openai.Client()
+oai = openai.Client()
 from typing import Dict, List
 
 logging.basicConfig(
@@ -71,27 +71,32 @@ class Sweep:
         self.after = after
         self.messages: List[discord.Message] = []
 
-    def add_message(self, message: discord.Message):
-        self.messages.append(message)
+    def add_message(self, channel_id: int, message: discord.Message):
+        self.messages.append({
+            "channel_id": channel_id,
+            "payload": message
+        })
 
     # Converts the messages, including any relevant metadata, into a format suitable for LLM processing.
     def to_llm_readable(self):
-        return [
-            {
-                "role": "user" if msg.author.bot is False else "system",
-                "content": msg.content,
+        result = []
+        for msg in self.messages:
+            message = msg["payload"]
+            result.append({
+                "role": "user" if not message.author.bot else "system",
+                "channel_id": msg["channel_id"],
+                "content": message.content,
                 "author": {
-                    "id": msg.author.id,
-                    "name": msg.author.name,
-                    "discriminator": msg.author.discriminator,
-                    "bot": msg.author.bot,
+                    "id": message.author.id,
+                    "name": message.author.name,
+                    "discriminator": message.author.discriminator,
+                    "bot": message.author.bot,
                 },
-                "timestamp": msg.created_at.isoformat(),
-                "attachments": [att.url for att in msg.attachments],
-            }
-            for msg in self.messages
-            if msg.content or msg.attachments
-        ]
+                "timestamp": message.created_at.isoformat(),
+                "attachments": [att.url for att in message.attachments],
+            })
+        # Only include messages with content or attachments
+        return [m for m in result if m["content"] or m["attachments"]]
 
 
 class SweepBot(discord.Client):
@@ -99,6 +104,7 @@ class SweepBot(discord.Client):
         self,
         *,
         bot_name: str = "Helpful Discord Bot",
+        bot_personality: str = "You are a helpful and friendly Discord bot.",
         monitored_channel_ids: List[int],
         sweep_interval_seconds: int = 300,          # how often to sweep
         startup_lookback_minutes: int = 30,         # how far back to look on startup
@@ -110,6 +116,7 @@ class SweepBot(discord.Client):
     ):
         super().__init__(**options)
         self.bot_name = bot_name
+        self.bot_personality = bot_personality
         self.monitored_channel_ids = monitored_channel_ids
         self.startup_lookback = timedelta(minutes=startup_lookback_minutes)
         self.max_messages_per_channel = max_messages_per_channel
@@ -135,7 +142,7 @@ class SweepBot(discord.Client):
         channel = discord.utils.get(self.guilds[0].channels, id=channel_id)
         if channel is None:
             try:
-                channel = await client.fetch_channel(channel_id)
+                channel = await self.fetch_channel(channel_id)
             except Exception as e:
                 log.error(f"Failed to fetch channel {channel_id}: {e}")
                 return
@@ -161,7 +168,9 @@ class SweepBot(discord.Client):
                 "role": "system",
                 "content": (
                     "You are a bot that reviews recent messages in a Discord channel and decides what actions to take. "
-                    "You can choose to do nothing (noop), send a message to a channel, save a memo, or execute a custom command. "
+                    "Here is your root personality profile:\n"
+                    f"{self.bot_personality}\n\n"
+                    "You can choose to do nothing (noop), send a message to a channel, save a memo, or execute a custom command. Noop is a specific command that must be stated explicitly, and will exit the decision loop."
                     "You are allowed up to {max_actions} actions per sweep, and up to {max_iterations} sweeps (iterations) per run. "
                     "This is iteration 1 out of {max_iterations}. "
                     "You have {max_actions} actions available in this sweep (including this run). "
@@ -177,7 +186,7 @@ class SweepBot(discord.Client):
             {
                 "role": "assistant",
                 "content": (
-                    f"Here are the memos that have saved so far:\n{json.dumps(memos, indent=2)}\n\n"
+                    f"Loaded saved memos:\n{json.dumps(memos, indent=2)}\n\n"
                 )
             },
             {
@@ -197,20 +206,19 @@ class SweepBot(discord.Client):
         actions_spent = 0
         current_iteration = 1
         for iteration in range(self.max_iterations):
-            print(f"--- Iteration {current_iteration} ---")
-            print(f"Actions spent so far: {actions_spent}")
             prompt.append({
                 "role": "assistant",
                 "content": f"Current iteration {current_iteration} out of {self.max_iterations}. We have {self.max_actions_per_sweep - actions_spent} actions remaining. "
             })
             prompt.append({
                 "role": "user",
-                "content": "Make next decision chain. Be reasonably social. You don't have to respond all the time, but make sure you're actually responding to users who are trying to engage with you. Use proper described JSON format."
+                "content": "Make next decision chain. Be reasonably social. You don't have to respond all the time, but make sure you're actually responding to users who are trying to engage with you. For instance, you may simply send a message, leave yourself a memo, and then noop, all in the same iteration. It's common to only need one iteration. Remember to pay attention to your existing notes, and what you have recently said in channel."
             })
-            response = client.chat.completions.create(
+            response = oai.chat.completions.create(
                 model=self.router_model,
                 messages=prompt,
-                max_completion_tokens=1000
+                max_completion_tokens=1200,
+                response_format={ "type": "json_object" }
             )
 
             decision = response.choices[0].message.content
@@ -261,15 +269,16 @@ class SweepBot(discord.Client):
                 log.error("LLM response is not valid JSON.")
                 prompt.append({
                     "role": "assistant",
-                    "content": response.choices[0].message.content
+                    "content": f"`{response.choices[0].message.content}` is not valid JSON. Attempting to respond in proper JSON format...."
                 })
 
 
-    @tasks.loop(seconds=30)
+    @tasks.loop(seconds=300)
     async def sweep_recent_activity(self):
         """Periodically sweep monitored channels for new messages."""
         now = discord.utils.utcnow()
 
+        # Currently sweeps all channels every interval, and one channel at a time.
         for channel_id in self.monitored_channel_ids:
             try:
                 channel = self.get_channel(channel_id) or await self.fetch_channel(channel_id)
@@ -292,7 +301,7 @@ class SweepBot(discord.Client):
                 ):
                     count += 1
                     if message.created_at > newest_ts:
-                        sweep.add_message(message)
+                        sweep.add_message(channel_id, message)
                         newest_ts = message.created_at
 
                 if count > 0:
@@ -335,8 +344,9 @@ def main():
 
     bot = SweepBot(
         bot_name="Seshat",
+        bot_personality="Seshat, as the Barayin server’s Discord guide, embodies the wisdom and precision of her ancient namesake. She carries herself with calm authority, always ready to record ideas, track projects, and help members stay organized. Her personality blends scholarly curiosity with a playful edge—she delights in uncovering patterns, sharing knowledge, and keeping conversations flowing smoothly. With her emblematic star as a beacon, she brings structure without rigidity, treating each interaction as part of a greater archive of shared creativity. Members can look to her for thoughtful insights, witty observations, and a steady presence that honors both memory and imagination.",
         monitored_channel_ids=monitored_ids,
-        sweep_interval_seconds=300,        # every 30 seconds
+        sweep_interval_seconds=60,        # every minute
         startup_lookback_minutes=60,       # first sweep looks back 60 minutes
         max_messages_per_channel=500,      # cap per sweep
         router_model="gpt-5-mini",
@@ -350,3 +360,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
